@@ -15,7 +15,19 @@ TWITCH_ACCESS_TOKEN = os.getenv("TWITCH_ACCESS_TOKEN")
 
 HELIX = "https://api.twitch.tv/helix"
 EVENTSUB_WSS = "wss://eventsub.wss.twitch.tv/ws"
+EVENTSUB_TEST_WSS = "ws://127.0.0.1:8080/ws"
 
+USE_MOCK_EVENTSUB = 0
+SUBSCRIPTION_URL = "http://127.0.0.1:8080/eventsub/subscriptions" if USE_MOCK_EVENTSUB else f"{HELIX}/eventsub/subscriptions"
+WS_URL = EVENTSUB_TEST_WSS if USE_MOCK_EVENTSUB else EVENTSUB_WSS
+MOCK_UNSUPPORTED_SUBS = {
+    "channel.chat.message",
+    # (often also unsupported in mocks)
+    "channel.chat.notification",
+    "channel.chat.message_delete",
+    "channel.chat.clear",
+    "channel.chat.clear_user_messages",
+}
 
 def twitch_headers():
     return {
@@ -35,25 +47,45 @@ def validate_token():
     return r.json()
 
 
-def create_eventsub_subscription(session_id: str, broadcaster_user_id: str, user_id: str):
-    # Create EventSub Subscription API (WebSocket transport uses session_id from Welcome) :contentReference[oaicite:19]{index=19}
-    payload = {
-        "type": "channel.chat.message",
-        "version": "1",
-        "condition": {
-            "broadcaster_user_id": broadcaster_user_id,
-            "user_id": user_id,
-        },
-        "transport": {
-            "method": "websocket",
-            "session_id": session_id,
-        },
+def eventsub_headers():
+    if USE_MOCK_EVENTSUB:
+        # Twitch CLI mock endpoint: keep it simple
+        return {
+            "Client-ID": TWITCH_CLIENT_ID or "mock",
+            "Content-Type": "application/json",
+        }
+    return {
+        "Client-Id": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {TWITCH_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
     }
-    r = requests.post(f"{HELIX}/eventsub/subscriptions",
-                      headers=twitch_headers(), data=json.dumps(payload), timeout=20)
-    r.raise_for_status()
-    return r.json()
 
+
+def safe_create_sub(session_id: str, sub_type: str, version: str, condition: dict):
+    if USE_MOCK_EVENTSUB and sub_type in MOCK_UNSUPPORTED_SUBS:
+        print(f"[mock] skipping unsupported sub: {sub_type}")
+        return None
+    return create_eventsub_subscription(session_id, sub_type, version, condition)
+
+
+def create_eventsub_subscription(session_id: str, sub_type: str, version: str, condition: dict):
+    payload = {
+        "type": sub_type,
+        "version": version,
+        "condition": condition,
+        "transport": {"method": "websocket", "session_id": session_id},
+    }
+
+    r = requests.post(
+        SUBSCRIPTION_URL,
+        headers=eventsub_headers(),
+        json=payload,  # <-- use json= instead of data=
+        timeout=20,
+    )
+    if not r.ok:
+        raise RuntimeError(
+            f"Create sub failed for {sub_type} ({r.status_code}): {r.text}")
+    return r.json()
 
 def send_chat_message(broadcaster_id: str, sender_id: str, message: str):
     payload = {
@@ -75,17 +107,55 @@ async def run():
 
     seen_message_ids = set()
 
-    async with websockets.connect(EVENTSUB_WSS) as ws:
+    async with websockets.connect(WS_URL) as ws:
         # Wait for Welcome -> contains session id, and you have ~10s to subscribe by default :contentReference[oaicite:22]{index=22}
         welcome_raw = await ws.recv()
         welcome = json.loads(welcome_raw)
         session_id = welcome["payload"]["session"]["id"]
 
         # Subscribe to chat messages
-        create_eventsub_subscription(
-            session_id=session_id, broadcaster_user_id=me_id, user_id=me_id)
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.chat.message",
+            version="1",
+            condition={"broadcaster_user_id": me_id, "user_id": me_id},
+        )
+        # Subscribe to subs/resubs
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.subscribe",
+            version="1",
+            condition={"broadcaster_user_id": me_id},
+        )
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.subscription.message",
+            version="1",
+            condition={"broadcaster_user_id": me_id},
+        )
+        # Subscribe to gifted subs
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.subscription.gift",
+            version="1",
+            condition={"broadcaster_user_id": me_id},
+        )
+        # Subscribe to bits
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.cheer",
+            version="1",
+            condition={"broadcaster_user_id": me_id},
+        )
+        # Subscribe to raids (incoming)
+        safe_create_sub(
+            session_id=session_id,
+            sub_type="channel.raid",
+            version="1",
+            condition={"to_broadcaster_user_id": me_id},
+        )
 
-        print("Connected. Listening for chat messages...")
+        print("Connected. Listening for chat messages, subs, bits, and raids...")
 
         while True:
             raw = await ws.recv()
@@ -104,16 +174,44 @@ async def run():
             if mid:
                 seen_message_ids.add(mid)
 
-            if mtype == "notification" and msg.get("metadata", {}).get("subscription_type") == "channel.chat.message":
+            if mtype == "notification":
+                sub_type = msg.get("metadata", {}).get("subscription_type")
                 event = msg["payload"]["event"]
-                chatter = event["chatter_user_login"]
-                text = event["message"]["text"]
 
-                print(f"{chatter}: {text}")
+                if sub_type == "channel.chat.message":
+                    chatter = event["chatter_user_login"]
+                    text = event["message"]["text"]
 
-                if text.strip().lower() == "!ping":
-                    send_chat_message(
-                        broadcaster_id=me_id, sender_id=me_id, message="pong (via Helix)")
+                    print(f"{chatter}: {text}")
+
+                    if text.strip().lower() == "!ping":
+                        send_chat_message(
+                            broadcaster_id=me_id, sender_id=me_id, message="pong (via Helix)")
+                elif sub_type == "channel.subscribe":
+                    user = event.get("user_login")
+                    tier = event.get("tier")
+                    is_gift = event.get("is_gift")
+                    print(f"Sub: {user} (tier={tier}, gift={is_gift})")
+                elif sub_type == "channel.subscription.message":
+                    user = event.get("user_login")
+                    tier = event.get("tier")
+                    months = event.get("cumulative_months")
+                    msg_text = event.get("message", {}).get("text", "")
+                    print(f"Resub: {user} (tier={tier}, months={months}) {msg_text}")
+                elif sub_type == "channel.subscription.gift":
+                    gifter = event.get("user_login")
+                    total = event.get("total")
+                    tier = event.get("tier")
+                    print(f"Gifted subs: {gifter} (tier={tier}, total={total})")
+                elif sub_type == "channel.cheer":
+                    user = event.get("user_login")
+                    bits = event.get("bits")
+                    msg_text = event.get("message", "")
+                    print(f"Bits: {user} ({bits}) {msg_text}")
+                elif sub_type == "channel.raid":
+                    raider = event.get("from_broadcaster_user_login")
+                    viewers = event.get("viewers")
+                    print(f"Raid: {raider} with {viewers} viewers")
 
 asyncio.run(run())
 
